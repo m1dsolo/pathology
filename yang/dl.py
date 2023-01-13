@@ -1,12 +1,13 @@
-import torch, os
+import torch, os, h5py
 from torch import nn
 from torch.nn import functional as F
 from torch.nn import DataParallel
 from torch.cuda import device_count
 from sklearn.metrics import roc_auc_score
 import numpy as np
+import pandas as pd
 
-from yang.yang import update_json, mkdir
+from yang.yang import mkdir
 
 def get_all_devices():
     return [f'cuda:{i}' for i in range(device_count())] if device_count() else ['cpu']
@@ -50,7 +51,7 @@ class Logger():
             self.labels.extend(labels.tolist())
             self.probs.extend(probs.tolist())
             for label, prob in zip(labels, probs):
-                self.matrix[label, int(prob >= 0.5)] += 1
+                self.matrix[int(label), int(prob >= 0.5)] += 1
         else:
             self.labels.append(labels)
             self.probs.append(probs)
@@ -101,42 +102,59 @@ class Logger():
             d[attr] = eval(f'self.{attr}').item()
         return d
 
-class EarlyStopping:
-    def __init__(self, net, optimizer, fold='', patience=20, stop_epoch=50, checkpoint_path='.'):
-        self.net = net
-        self.optimizer = optimizer
-        self.fold = fold
+class EarlyStop:
+    def __init__(self, patience=20, min_stop_epoch=50, max_stop_epoch=200):
         self.patience = patience
-        self.stop_epoch = stop_epoch
+        self.min_stop_epoch = min_stop_epoch
+        self.max_stop_epoch = max_stop_epoch
         self.counter = 0
         self.min_loss = np.Inf
-        self.checkpoint_path = os.path.join(checkpoint_path, str(fold))
-        mkdir(self.checkpoint_path)
-        self.best_epoch = 0
 
-    def __call__(self, logger, epoch):
-        if logger.loss < self.min_loss:
-            self.min_loss = logger.loss
+        self.stop_epoch = 0
+        self.best_epoch = 0
+        self.early_stop = False
+
+    def __call__(self, loss, epoch):
+        if loss < self.min_loss:
+            self.min_loss = loss
             self.counter = 0
             self.best_epoch = epoch
-            torch.save(self.net.state_dict(), self.best_net_state_dict_name)
-            torch.save(self.optimizer.state_dict(), self.best_optimizer_state_dict_name)
-            update_json(os.path.join(self.checkpoint_path, 'checkpoints.json'), {epoch: logger.to_dict(['loss', 'acc', 'pos_acc', 'neg_acc', 'f1_score', 'auc'])})
         else:
             self.counter += 1
-            if self.counter >= self.patience and epoch >= self.stop_epoch:
-                return True
-        return False
 
-    @property
-    def best_net_state_dict_name(self):
-        return os.path.join(self.checkpoint_path, f'net_{self.best_epoch}.pt')
+        if self.counter > self.patience and epoch >= self.min_stop_epoch or epoch == self.max_stop_epoch:
+            self.stop_epoch = epoch
+            self.early_stop = True
 
-    @property
-    def best_optimizer_state_dict_name(self):
-        return os.path.join(self.checkpoint_path, f'optimizer_{self.best_epoch}.pt')
+class FinalLogger():
+    def __init__(self, attrs):
+        self.data = {}
+        for attr in attrs:
+            self.data[attr] = []
+        self.stop_epochs = []
+        self.best_epochs = []
 
-def print_net(net):
+    def update(self, logger, stop_epoch, best_epoch):
+        for attr in self.data.keys():
+            self.data[attr].append(eval(f'logger.{attr}.item()'))
+        self.stop_epochs.append(stop_epoch)
+        self.best_epochs.append(best_epoch)
+
+    def get_res_dict(self):
+        res = {
+            'stop_epochs': self.stop_epochs,
+            'best_epochs': self.best_epochs
+        }
+        for attr in self.data.keys():
+            res[attr] = {}
+            res[attr]['data'] = self.data[attr]
+            res[attr]['min'] = min(self.data[attr])
+            res[attr]['mean'] = sum(self.data[attr]) / len(self.data[attr])
+            res[attr]['max'] = max(self.data[attr])
+
+        return res
+
+def print_net_parameters(net):
     print(net)
 
     num_params, num_train_params = 0, 0
@@ -159,6 +177,57 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
+def read_split(split_name):
+    csv = pd.read_csv(split_name)
+    return list(csv['file_name']), list(csv['label'])
+
+def read_h5(feature_name, key):
+    with h5py.File(feature_name, 'r') as f:
+        return f[key][:]
+
+def do_epoch(is_train: bool, loader, net, loss_fn, optimizer=None, lr_scheduler=None):
+    net.train() if is_train else net.eval()
+    device = get_net_one_device(net)
+
+    with WithNone() if is_train else torch.no_grad():
+        res = Logger()
+        for i, (x, y) in enumerate(loader):
+            x, y = x.to(device), y.to(device)
+
+            logits = net(x)
+
+            loss = loss_fn(logits.unsqueeze(dim=0), y)
+            probs = F.softmax(logits, dim=0)
+            res.add(loss.item(), y.item(), probs[1].item())
+
+            if is_train:
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                if lr_scheduler:
+                    lr_scheduler.step()
+
+            if (i + 1) % 10 == 0:
+                print(f'batch: {i + 1}/{len(loader)}')
+
+        return res
+
+# label.csv --> (file_names, labels)
+def read_label_file(label_file_name):
+    df = pd.read_csv(label_file_name, index_col=0)
+    return np.array(df['file_name'], dtype=str), np.array(df['label'], dtype=np.uint8)
+
+def save_label_file(label_file_name, file_names, labels):
+    df = pd.DataFrame({'file_name': file_names, 'label': labels}, index=range(1, len(file_names) + 1))
+    df.to_csv(label_file_name)
+
+def print_net_activations(net, x):
+    from yang.net import NetExtractor
+    extractor = NetExtractor(net, regist_grad=False)
+    extractor(x)
+    for name, val in extractor.activations.items():
+        print(name, val.shape)
 
 def net_load_state_dict(net, state_dict_name):
     net.load_state_dict(torch.load(state_dict_name))

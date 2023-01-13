@@ -1,39 +1,54 @@
-import openslide, h5py, os
+import openslide, h5py, os, timm
 from torch.utils.data import Dataset, DataLoader
-from torchvision.transforms import Compose, ToTensor, Normalize
+from torchvision.transforms import Compose, ToTensor, Normalize, Resize
 from torch.cuda import device_count
-from yang.yang import get_file_names_by_suffix
 from torchvision.models import resnet50, ResNet50_Weights
 from torch.nn import DataParallel
 import torch
 import numpy as np
+
 from models.resnet_custom import resnet50_baseline
 
-devices = [f'cuda:{i}' for i in range(device_count())] if device_count() else ['cpu']
+from yang.yang import get_file_names_by_suffix, mkdir, rmdir
+from yang.dl import net2devices, get_all_devices
+from yang.dataset import PatchDataset, PatchLoader
+from yang.net import CTransPath
 
-class WSI_Bag(Dataset):
-    def __init__(self, wsi_name, patch_name):
-        self.wsi = openslide.open_slide(wsi_name)
-        with h5py.File(patch_name, 'r') as f:
-            dset = f['coords']
-            self.coords = dset[:]
-            self.patch_level = dset.attrs['patch_level']
-            self.patch_size = dset.attrs['patch_size']
+# devices = get_all_devices()
+devices = ['cuda:1']
 
-        self.transform = Compose([ToTensor(), Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))])
+task = 'HE'
 
-    def __len__(self):
-        return len(self.coords)
+if task == 'IHC': 
+    wsi_path = '/home/yangxuan/dataset/IHC/'
+    patch_path = '/home/yangxuan/CLAM/patches/IHC/IHC/'
+    # out_path = '/home/yangxuan/CLAM/features/IHC/resnet50_resize224/'
+    out_path = '/home/yangxuan/CLAM/features/IHC/ctranspath/'
 
-    def __getitem__(self, idx):
-        img = self.wsi.read_region(self.coords[idx], self.patch_level, (self.patch_size, ) * 2).convert('RGB') 
-        img = self.transform(img).unsqueeze(0)
-        return img, self.coords[idx]
+    args = {
+            'net': {
+                'type': 'CTransPath', # ['ResNet50', 'CTransPath']
+            }, 
+            'batch_size': 512, 
+            'transform': 'resize', # ['resize', 'None']
+    }
+elif task == 'HE':
+    wsi_path = '/home/yangxuan/dataset/HE/'
+    patch_path = '/home/yangxuan/CLAM/patches/HE/HE_xml/'
+    out_path = '/home/yangxuan/CLAM/features/HE/HE_xml_ctranspath/'
+    # out_path = '/home/yangxuan/CLAM/features/HE/HE_xml_resnet50/'
 
-def collate_fn(batch):
-    img = torch.cat([item[0] for item in batch], dim=0)
-    coords = np.vstack([item[1] for item in batch])
-    return [img, coords]
+    args = {
+            'net': {
+                'type': 'CTransPath', # ['ResNet50', 'CTransPath']
+            }, 
+            # 'net': {
+                # 'type': 'ResNet50', # ['ResNet50', 'CTransPath']
+            # }, 
+            'batch_size': 512,
+            'transform': 'resize', # ['resize', 'None']
+            # 'transform': 'None', # ['resize', 'None']
+    }
 
 def save_h5(h5_name, data_dict, attr_dict=None):
     with h5py.File(h5_name, 'a') as f:
@@ -47,10 +62,14 @@ def save_h5(h5_name, data_dict, attr_dict=None):
                 dset.resize(len(dset) + val.shape[0], axis=0)
                 dset[-val.shape[0]:] = val
 
-def extract_features(wsi_name, patch_name, out_name, net):
-    dataset = WSI_Bag(wsi_name, patch_name)
-    loader = DataLoader(dataset, batch_size=1024, num_workers=4, pin_memory=True, collate_fn=collate_fn)
+def init_patch_loader():
+    transform = [Resize((224, 224))] if args['transform'] == 'resize' else []
+    transform.extend([ToTensor(), Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))])
+    dataset = PatchDataset(wsi_name, patch_name, Compose(transform))
+    return PatchLoader(dataset, args['batch_size'], 4)
 
+def extract_features(wsi_name, patch_name, out_name, net):
+    loader = init_patch_loader()
     for i, (patches, coords) in enumerate(loader):
         with torch.no_grad():
             patches = patches.to(devices[0], non_blocking=True)
@@ -60,30 +79,26 @@ def extract_features(wsi_name, patch_name, out_name, net):
 
             print(f'extract_features:{i + 1}/{len(loader)}')
 
+def init_net():
+    if args['net']['type'] == 'ResNet50':
+        net = net2devices(resnet50_baseline(pretrained=True), devices)
+    elif args['net']['type'] == 'CTransPath':
+        net = net2devices(CTransPath(), devices)
+    net.eval()
+
+    return net
+
 if __name__ == '__main__':
-    # wsi_path = '/home/yangxuan/dataset/IHC/'
-    # patch_path = '/home/yangxuan/code/python/CLAM/results/IHC/patches/'
-    # out_path = '/home/yangxuan/data/features/IHC/h5_files'
-    wsi_path = '/home/yangxuan/dataset/HE/'
-    patch_path = '/home/yangxuan/CLAM/patches/HE_30/patches/'
-    out_path = '/home/yangxuan/CLAM/features/HE/'
+    mkdir(out_path)
     file_names = get_file_names_by_suffix(patch_path, '.h5')
 
-    # net = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-    net = resnet50_baseline(pretrained=True)
-    net = net.to(devices[0]) if len(devices) == 1 else DataParallel(net.to(devices[0]), devices)
-    net.eval()
+    net = init_net()
 
     err = 0
     for i, file_name in enumerate(file_names):
         wsi_name = os.path.join(wsi_path, file_name + '.svs')
         patch_name = os.path.join(patch_path, file_name + '.h5')
         out_name = os.path.join(out_path, file_name + '.h5')
-
-        # if os.path.exists(out_name):
-            # print('already exists')
-            # print(f'{i + 1}/{len(file_names)}')
-            # continue
 
         try:
             extract_features(wsi_name, patch_name, out_name, net)

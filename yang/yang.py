@@ -1,37 +1,38 @@
-import os, cv2, openslide, h5py
+import os, cv2, openslide, h5py, json, shutil
 import numpy as np
 from xml.etree import ElementTree as ET
 from PIL import Image
 from matplotlib import pyplot as plt
 from queue import Queue
 from types import FunctionType
-from matplotlib import pyplot as plt
-import json
+
+import re, inspect
 
 Image.MAX_IMAGE_PIXELS = None
 
 def get_file_names_by_suffix(path, suffix):
     return [file[:-len(suffix)] for file in os.listdir(path) if file[-len(suffix):] == suffix]
 
-# xml --> [[(x1, y1), (x2, y2), ...], [...], ...]
-def xml2polygons(xml_name, base=1):
+# xml --> ([(x1, y1), (x2, y2), ...], [...], ...)
+def xml2contours(xml_name, base=1):
     tree = ET.parse(xml_name)
     root = tree.getroot()
     res = []
     for coordinate in root.iter('Coordinates'):
         arr = []
         for child in coordinate.iter('Coordinate'):
-            arr.append((float(child.attrib['X']) * base, float(child.attrib['Y']) * base))
+            arr.append((float(child.attrib['X']) / base, float(child.attrib['Y']) / base))
         res.append(np.array(arr, np.int32))
-    return res
+    return tuple(res)
 
 def xml2mask(xml_name, shape, base=1):
     mask = np.zeros(shape, dtype=np.uint8)
-    cv2.fillPoly(mask, xml2polygons(xml_name, base), 255)
+    cv2.fillPoly(mask, xml2contours(xml_name, base), 255)
     return mask
 
-def add_polylines(thumbnail, xml_name, base=1):
-    return cv2.polylines(thumbnail, xml2polygons(xml_name, base), True, (0, 0, 255), 3)
+# color(BGR)
+def img_add_xml(thumbnail, xml_name, base=1, color=(255, 0, 0), thickness=3):
+    return cv2.polylines(thumbnail, xml2contours(xml_name, base), True, color=color, thickness=thickness)
 
 def gen_thumbnail(svs_name, xml_name, out_name=None, thumbnail_size=1920):
     with openslide.open_slide(svs_name) as slide:
@@ -39,7 +40,7 @@ def gen_thumbnail(svs_name, xml_name, out_name=None, thumbnail_size=1920):
         base = slide.dimensions[1] / thumbnail.shape[0]
 
     if xml_name:
-        thumbnail = add_polylines(thumbnail, xml_name, 1 / base)
+        thumbnail = img_add_xml(thumbnail, xml_name, base)
 
     if out_name:
         Image.fromarray(thumbnail).save(out_name)
@@ -51,7 +52,7 @@ def crop_thumbnail(svs_name, xml_name, png_name, out_name, thumbnail_size=1920):
     with openslide.open_slide(svs_name) as slide:
         base = slide.dimensions[0] / png.size[0]
 
-    rect = xml2polygons(xml_name, 1)[0].astype(np.int64)
+    rect = xml2contours(xml_name, 1)[0].astype(np.int64)
     x0, x1, y0, y1 = int(1e9), -int(1e9), int(1e9), -int(1e9)
     for point in rect:
         x0 = min(x0, point[0] / base)
@@ -190,7 +191,7 @@ def rect2xml(rect, base, pad=0):
 
     return ET.ElementTree(asap)
 
-def read_svs(svs_name, level=2, needs=None):
+def read_svs(svs_name, level=2, needs=None, mode='L'):
     def process_needs(needs):
         res = []
         for need in needs:
@@ -201,9 +202,14 @@ def read_svs(svs_name, level=2, needs=None):
         return res
 
     with openslide.open_slide(svs_name) as slide:
-        img = np.array(slide.read_region((0, 0), level, slide.level_dimensions[level]).convert('L'))
+        img = np.array(slide.read_region((0, 0), level, slide.level_dimensions[level]).convert(mode))
 
         return (img, *process_needs(needs)) if needs else img
+
+# coord(x, y)
+def read_patch(svs_name, coord, patch_size=256, mode='RGB'):
+    with openslide.open_slide(svs_name) as slide:
+        return np.array(slide.read_region((coord[1], coord[0]), 0, (patch_size, patch_size)).convert(mode))
 
 """
 描述：在IHC图像中找到与HE图像相匹配的矩形区域并返回其对应的xml文件。
@@ -240,6 +246,8 @@ def count(img):
     return {key: val for key, val in zip(np.arange(257), cnt) if val != 0}
 
 def gen_merge_fig(img1, img2, out_name=None, no_tick=False):
+    os.environ['DISPLAY'] = ''
+
     if isinstance(img1, str):
         img1 = cv2.imread(img1)
     if isinstance(img2, str):
@@ -302,11 +310,6 @@ def reshape_list(lst, shape):
     assert len(lst) == shape[0] * shape[1]
     return [lst[i * shape[1]:(i + 1) * shape[1]] for i in range(shape[0])]
 
-def point_is_in_rect(point, rect):
-    x, y = point
-    x_min, x_max, y_min, y_max = min(rect[:, 0]), max(rect[:, 0]), min(rect[:, 1]), max(rect[:, 1])
-    return x >= x_min and x <= x_max and y >= y_min and y <= y_max
-
 def stitch(svs_name, patch_name, out_name=None, level=2):
     with h5py.File(patch_name, 'r') as f:
         dset = f['coords']
@@ -330,28 +333,28 @@ def stitch(svs_name, patch_name, out_name=None, level=2):
 
     return canvas
 
+def point_in_contour(point: tuple, contour: np.array):
+    return cv2.pointPolygonTest(contour, point, False) >= 0
+
 def process_h5(patch_name, xml_name, out_name):
-    rect = xml2polygons(xml_name)[0]
-    x0, x1, y0, y1 = rect[0][0], rect[2][0], rect[0][1], rect[2][1]
-    rect = np.array([[x0, y0], [x0, y1 - 256], [x1 - 256, y1 - 256], [x1 - 256, y0]])
-
+    contours = xml2contours(xml_name)
     coords = []
-    # features = []
-    fin = h5py.File(patch_name, 'r')
+    with h5py.File(patch_name, 'r') as fin, h5py.File(out_name, 'w') as fout:
+        for coord in fin['coords']:
+            coord = (int(coord[0]), int(coord[1]))
+            flag = False
+            for contour in contours:
+                if point_in_contour(coord, contour):
+                    flag = True
+                    break
+            if flag:
+                coords.append(coord)
 
-    for coord in fin['coords']:
-        if point_is_in_rect(coord, rect):
-            coords.append(coord)
-            # features.append(feature)
+        fout.create_dataset('/coords', data=coords)
+        fout['coords'].attrs.update(fin['coords'].attrs)
+        fout['coords'].attrs['save_path'] = os.path.dirname(out_name)
 
-    fout = h5py.File(out_name, 'w') 
-    fout.create_dataset('/coords', data=coords)
-    fout['coords'].attrs.update(fin['coords'].attrs)
-    # fout['features'] = features
-
-    print(f'{len(coords)}/{len(fin["coords"])}')
-
-    fin.close(), fout.close()
+        print(f'{len(coords)}/{len(fin["coords"])}')
 
 def dict2json(json_name, d):
     with open(json_name, 'w') as f:
@@ -371,3 +374,15 @@ def update_json(json_name, d):
 def mkdir(dir_name):
     if not os.path.exists(dir_name):
         os.makedirs(dir_name)
+
+def rmdir(dir_name):
+    if os.path.exists(dir_name):
+        shutil.rmtree(dir_name)
+
+def mkdirs(dir_names):
+    for dir_name in dir_names:
+        mkdir(dir_name)
+
+def rmdirs(dir_names):
+    for dir_name in dir_names:
+        rmdir(dir_name)
