@@ -15,40 +15,33 @@ from yang.dataset import PatchDataset, PatchLoader
 from yang.net import CTransPath
 
 # devices = get_all_devices()
-devices = ['cuda:1']
+devices = ['cuda:0']
 
 task = 'HE'
 
 if task == 'IHC': 
-    wsi_path = '/home/yangxuan/dataset/IHC/'
-    patch_path = '/home/yangxuan/CLAM/patches/IHC/IHC/'
-    # out_path = '/home/yangxuan/CLAM/features/IHC/resnet50_resize224/'
-    out_path = '/home/yangxuan/CLAM/features/IHC/ctranspath/'
-
+    exp_name = 'ResNet50'
     args = {
             'net': {
-                'type': 'CTransPath', # ['ResNet50', 'CTransPath']
+                'type': 'ResNet50', # ['ResNet50', 'CTransPath']
             }, 
-            'batch_size': 512, 
+            'batch_size': 1024, 
             'transform': 'resize', # ['resize', 'None']
     }
 elif task == 'HE':
-    wsi_path = '/home/yangxuan/dataset/HE/'
-    patch_path = '/home/yangxuan/CLAM/patches/HE/HE_xml/'
-    out_path = '/home/yangxuan/CLAM/features/HE/HE_xml_ctranspath/'
-    # out_path = '/home/yangxuan/CLAM/features/HE/HE_xml_resnet50/'
-
+    exp_name = 'no_xml/ResNet50'
     args = {
             'net': {
-                'type': 'CTransPath', # ['ResNet50', 'CTransPath']
+                'type': 'ResNet50', # ['ResNet50', 'CTransPath']
             }, 
-            # 'net': {
-                # 'type': 'ResNet50', # ['ResNet50', 'CTransPath']
-            # }, 
-            'batch_size': 512,
-            'transform': 'resize', # ['resize', 'None']
-            # 'transform': 'None', # ['resize', 'None']
+            'batch_size': 1024,
+            'transform': 'None', # ['resize', 'None']
     }
+
+wsi_path = os.path.join('/home/yangxuan/dataset/', task)
+patch_path = os.path.join('/home/yangxuan/CLAM/patches/', task, task)
+out_path = os.path.join('/home/yangxuan/CLAM/features/', task, exp_name)
+mkdir(out_path)
 
 def save_h5(h5_name, data_dict, attr_dict=None):
     with h5py.File(h5_name, 'a') as f:
@@ -62,14 +55,14 @@ def save_h5(h5_name, data_dict, attr_dict=None):
                 dset.resize(len(dset) + val.shape[0], axis=0)
                 dset[-val.shape[0]:] = val
 
-def init_patch_loader():
+def init_patch_loader(wsi_name):
     transform = [Resize((224, 224))] if args['transform'] == 'resize' else []
     transform.extend([ToTensor(), Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))])
     dataset = PatchDataset(wsi_name, patch_name, Compose(transform))
     return PatchLoader(dataset, args['batch_size'], 4)
 
 def extract_features(wsi_name, patch_name, out_name, net):
-    loader = init_patch_loader()
+    loader = init_patch_loader(wsi_name)
     for i, (patches, coords) in enumerate(loader):
         with torch.no_grad():
             patches = patches.to(devices[0], non_blocking=True)
@@ -89,7 +82,6 @@ def init_net():
     return net
 
 if __name__ == '__main__':
-    mkdir(out_path)
     file_names = get_file_names_by_suffix(patch_path, '.h5')
 
     net = init_net()

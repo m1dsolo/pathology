@@ -2,7 +2,7 @@ import torch, h5py, os, openslide
 import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
-from yang.dl import read_feature
+from yang.dl import read_h5
 
 
 class WSI_Dataset(Dataset):
@@ -16,7 +16,7 @@ class WSI_Dataset(Dataset):
 
     def __getitem__(self, idx):
         file_name, label = self.file_names[idx], self.labels[idx]
-        return read_feature(os.path.join(self.feature_path, file_name + '.h5')), label
+        return torch.from_numpy(read_h5(os.path.join(self.feature_path, file_name + '.h5'), 'features')), label
 
     def to_csv(self, csv_name, probs=None):
         d = {'file_name': self.file_names, 'label': self.labels}

@@ -182,36 +182,14 @@ def read_split(split_name):
     csv = pd.read_csv(split_name)
     return list(csv['file_name']), list(csv['label'])
 
-def read_h5(feature_name, key):
-    with h5py.File(feature_name, 'r') as f:
+def read_h5(h5_name, key):
+    with h5py.File(h5_name, 'r') as f:
         return f[key][:]
 
-def do_epoch(is_train: bool, loader, net, loss_fn, optimizer=None, lr_scheduler=None):
-    net.train() if is_train else net.eval()
-    device = get_net_one_device(net)
-
-    with WithNone() if is_train else torch.no_grad():
-        res = Logger()
-        for i, (x, y) in enumerate(loader):
-            x, y = x.to(device), y.to(device)
-
-            logits = net(x)
-
-            loss = loss_fn(logits.unsqueeze(dim=0), y)
-            probs = F.softmax(logits, dim=0)
-            res.add(loss.item(), y.item(), probs[1].item())
-
-            if is_train:
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-                if lr_scheduler:
-                    lr_scheduler.step()
-
-            if (i + 1) % 10 == 0:
-                print(f'batch: {i + 1}/{len(loader)}')
-
-        return res
+def save_h5(h5_name, key, val, attrs):
+    with h5py.File(h5_name, 'w') as f:
+        f.create_dataset(f'/{key}', data=val)
+        f[key].attrs.update(attrs)
 
 # label.csv --> (file_names, labels)
 def read_label_file(label_file_name):

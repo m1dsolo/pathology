@@ -5,30 +5,80 @@ from matplotlib import pyplot as plt
 import numpy as np
 from PIL import Image
 
-from yang.yang import read_svs, mkdir, img_add_xml, dict2json, read_patch
+from yang.yang import read_svs, mkdir, rmdir, img_add_xml, dict2json, read_patch, dict2csv
 from yang.dl import net_load_state_dict, net2devices, read_h5, read_label_file
 from yang.net import CLAM_2
 
-devices = ['cuda:0']
+devices = ['cuda:1']
 
-label_file_name = '/home/yangxuan/dataset/HE/label.csv'
-label_train_file_name = '/home/yangxuan/dataset/HE/label_train.csv'
-svs_path = '/home/yangxuan/dataset/HE/'
-xml_path = '/home/yangxuan/dataset/HE_xml/'
-feature_path = '/home/yangxuan/CLAM/features/HE/HE/'
-out_dir = '/home/yangxuan/CLAM/heatmap/HE/coolwarm_alpha1_rankdata_xml/'
-res_name = os.path.join(out_dir, 'res.json')
+task = 'HE'
 
-args = {
-    'cmap': 'coolwarm',
-    'alpha': 1,
-    'save_patch': {
-        'neg_num': 8,
-        'pos_num': 8
-    },
-    # 'save_patch': None,
-    'add_xml': True
-}
+if task == 'IHC':
+    exp_name = 'ResNet50_CLAM2_alpha0.4_rankdata'
+    args = {
+        'input': {
+            'exp': 'ResNet50_CLAM_2',
+            'fold': 1
+        },
+        'cmap': 'jet',
+        'alpha': 0.4,
+        'save_patch': {
+            'neg_num': 8,
+            'pos_num': 8
+        },
+        # 'save_patch': None,
+        'draw_xml': True,
+        'features': {
+            'type': 'ResNet50',
+            'use_xml': False,
+        },
+        'type': 'rankdata', # ['rankdata', 'normalize']
+    }
+elif task == 'HE':
+    exp_name = 'ResNet50_CLAM2_alpha0.4_rankdata_xml'
+    args = {
+        'input': {
+            'exp': 'ResNet50_CLAM_2',
+            'fold': 1
+        },
+        'cmap': 'jet',
+        'alpha': 0.4,
+        'save_patch': {
+            'neg_num': 8,
+            'pos_num': 8
+        },
+        # 'save_patch': None,
+        'draw_xml': True,
+        'features': {
+            'type': 'ResNet50',
+            'use_xml': True,
+        },
+        'type': 'rankdata', # ['rankdata', 'normalize']
+    }
+
+def init_feature_path():
+    if task == 'IHC':
+        return os.path.join('/home/yangxuan/CLAM/features/IHC', args['features']['type'])
+    elif task == 'HE':
+        return os.path.join('/home/yangxuan/CLAM/features/HE', 'xml' if args['features']['use_xml'] else 'no_xml', args['features']['type'])
+
+label_file_name = os.path.join('/home/yangxuan/dataset', task, 'label.csv')
+svs_path = os.path.join('/home/yangxuan/dataset', task)
+xml_path = os.path.join('/home/yangxuan/dataset', task + '_xml')
+
+input_exp, input_fold = args['input']['exp'], args['input']['fold']
+state_dict_name = os.path.join('/home/yangxuan/CLAM/checkpoint', task, input_exp, str(input_fold), 'net.pt')
+label_train_file_name = os.path.join('/home/yangxuan/CLAM/split/', task, input_exp, f'train_{input_fold}.csv')
+label_val_file_name = os.path.join('/home/yangxuan/CLAM/split/', task, input_exp, f'val_{input_fold}.csv')
+
+feature_path = init_feature_path() 
+out_dir = os.path.join('/home/yangxuan/CLAM/heatmap/', task, exp_name)
+res_name = os.path.join(out_dir, 'res.csv')
+
+rmdir(out_dir)
+mkdir(out_dir)
+# save args
+dict2json(os.path.join(out_dir, 'arg.json'), args)
 
 # scores(patch_num,) coords(patch_num, 2)
 def gen_heatmap(svs_name, scores, coords, xml_name=None, out_name=None, alpha=0.5, cmap='coolwarm'):
@@ -38,8 +88,10 @@ def gen_heatmap(svs_name, scores, coords, xml_name=None, out_name=None, alpha=0.
 
     heatmap = np.array(Image.new(size=(w, h), mode='RGB', color=(255, 255, 255))) # (h, w, 3)
 
-    # scores = (scores - scores.min()) / (scores.max() - scores.min())
-    scores = rankdata(scores, 'average') / len(scores)
+    if args['type'] == 'rankdata':
+        scores = rankdata(scores, 'average') / len(scores)
+    elif args['type'] == 'normalize':
+        scores = (scores - scores.min()) / (scores.max() - scores.min())
 
     cmap = plt.get_cmap(cmap)
     for score, coord in zip(scores, coords):
@@ -57,49 +109,53 @@ def gen_heatmap(svs_name, scores, coords, xml_name=None, out_name=None, alpha=0.
 
     return heatmap
 
-def save_patch(out_path, scores, coords):
-    neg_path = os.path.join(out_path, 'neg_patch')
-    pos_path = os.path.join(out_path, 'pos_patch')
-    mkdir(neg_path), mkdir(pos_path)
+def save_patch(svs_name, out_path, scores, coords):
+    orders = scores.argsort()
 
-    order = scores.argsort()
-    neg_scores, pos_scores = [], []
-    for i, idx in enumerate(order[:min(len(order), args['save_patch']['neg_num'])], 1):
-        patch = read_patch(svs_name, coords[idx])
-        neg_scores.append(scores[idx])
-        plt.imsave(os.path.join(neg_path, f'{i}.png'), patch)
-    for i, idx in enumerate(order[-1:max(-len(order), -args['save_patch']['pos_num']) - 1:-1], 1):
-        patch = read_patch(svs_name, coords[idx])
-        pos_scores.append(scores[idx])
-        plt.imsave(os.path.join(pos_path, f'{i}.png'), patch)
-    dict2json(os.path.join(neg_path, 'scores.json'), {f'{i + 1}.png': float(neg_scores[i]) for i in range(len(neg_scores))})
-    dict2json(os.path.join(pos_path, 'scores.json'), {f'{i + 1}.png': float(pos_scores[i]) for i in range(len(pos_scores))})
+    def func(out_path, is_pos=True):
+        mkdir(out_path)
+        file_names, sub_scores, sub_coords = [], [], []
+        order = orders[-1:max(-len(orders), -args['save_patch']['pos_num']) - 1:-1] if is_pos else orders[:min(len(orders), args['save_patch']['neg_num'])]
+
+        for i, idx in enumerate(order, 1):
+            patch = read_patch(svs_name, coords[idx])
+            sub_scores.append(scores[idx])
+            sub_coords.append(coords[idx])
+            plt.imsave(os.path.join(out_path, f'{i}_a{scores[idx]:.3f}_x{coords[idx][0]}_y{coords[idx][1]}.png'), patch)
+
+        # dict2csv(os.path.join(out_path, 'res.csv'), {'score': sub_scores, 'coord': sub_coords})
+
+    func(os.path.join(out_path, 'neg_patch'), False)
+    func(os.path.join(out_path, 'pos_patch'), True)
 
 def init_net():
     net = net2devices(CLAM_2(), devices)
-    net_load_state_dict(net, '/home/yangxuan/CLAM/checkpoint/IHC/clam_2/net.pt')
-    net.attention.softmax = False
+    net_load_state_dict(net, state_dict_name)
     net.eval()
 
     return net
 
-def clam_2(net, x):
-    logits = net(x)
+def get_scores(net, x):
+    net.attention.softmax = False
     scores = net.attention(net.fc(x))
-    return scores.detach().cpu().numpy(), logits
+    net.attention.softmax = True
+    return scores.detach().cpu().numpy()
 
 if __name__ == '__main__':
     file_names, labels = read_label_file(label_file_name)
+    # file_names, labels = file_names[:5], labels[:5]
+
     train_file_names, _ = read_label_file(label_train_file_name)
+    val_file_names, _ = read_label_file(label_val_file_name)
     # file_names = ['2020-312872022-08-29_HE']
 
     net = init_net()
 
-    probs = []
+    probs, types = [], []
     for i, (file_name, label) in enumerate(zip(file_names, labels)):
         out_path = os.path.join(out_dir, 'tumor' if label else 'normal', file_name)
         svs_name = os.path.join(svs_path, file_name + '.svs')
-        xml_name = os.path.join(xml_path, file_name + '.xml') if args['add_xml'] else None
+        xml_name = os.path.join(xml_path, file_name + '.xml') if args['draw_xml'] else None
         out_name = os.path.join(out_path, file_name + '.png')
         h5_name = os.path.join(feature_path, file_name + '.h5')
 
@@ -107,15 +163,22 @@ if __name__ == '__main__':
 
         x, coords = torch.from_numpy(read_h5(h5_name, 'features')).to(devices[0]), read_h5(h5_name, 'coords')
 
-        scores, logits = clam_2(net, x)
-        probs.append(torch.softmax(logits, dim=0)[1].item())
+        scores = get_scores(net, x)
+        logits = net(x)
+
+        probs.append(torch.softmax(logits, dim=0)[label].item())
+        if file_name in train_file_names:
+            types.append('train')
+        elif file_name in val_file_names:
+            types.append('val')
+        else:
+            types.append('test')
 
         if args['save_patch']:
-            save_patch(out_path, scores, coords)
+            save_patch(svs_name, out_path, scores, coords)
 
         heatmap = gen_heatmap(svs_name, scores, coords, xml_name, out_name, alpha=args['alpha'], cmap=args['cmap'])
 
         print(f'{i + 1}/{len(file_names)}, {file_name}')
 
-    d = {'file_name': file_names.tolist(), 'label': labels.tolist(), 'prob': probs, 'in_train': [int(file_name in train_file_names) for file_name in file_names]}
-    dict2json(res_name, d)
+    dict2csv(res_name, {'file_name': file_names.tolist(), 'label': labels.tolist(), 'prob': probs, 'type': types})

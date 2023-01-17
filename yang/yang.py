@@ -5,13 +5,16 @@ from PIL import Image
 from matplotlib import pyplot as plt
 from queue import Queue
 from types import FunctionType
+import pandas as pd
+from shutil import move
+from math import ceil
 
 import re, inspect
 
 Image.MAX_IMAGE_PIXELS = None
 
 def get_file_names_by_suffix(path, suffix):
-    return [file[:-len(suffix)] for file in os.listdir(path) if file[-len(suffix):] == suffix]
+    return [file[:-len(suffix)] for file in os.listdir(path) if file[-len(suffix):] == suffix] if suffix else os.listdir(path)
 
 # xml --> ([(x1, y1), (x2, y2), ...], [...], ...)
 def xml2contours(xml_name, base=1):
@@ -209,7 +212,7 @@ def read_svs(svs_name, level=2, needs=None, mode='L'):
 # coord(x, y)
 def read_patch(svs_name, coord, patch_size=256, mode='RGB'):
     with openslide.open_slide(svs_name) as slide:
-        return np.array(slide.read_region((coord[1], coord[0]), 0, (patch_size, patch_size)).convert(mode))
+        return np.array(slide.read_region(coord, 0, (patch_size, patch_size)).convert(mode))
 
 """
 描述：在IHC图像中找到与HE图像相匹配的矩形区域并返回其对应的xml文件。
@@ -310,7 +313,11 @@ def reshape_list(lst, shape):
     assert len(lst) == shape[0] * shape[1]
     return [lst[i * shape[1]:(i + 1) * shape[1]] for i in range(shape[0])]
 
-def stitch(svs_name, patch_name, out_name=None, level=2):
+def scale(shape, size):
+    x, y = max(shape[0], shape[1]), min(shape[0], shape[1])
+    return (size, ceil(size * y / x)) if shape[0] >= shape[1] else (ceil(size * y / x), size)
+
+def stitch(svs_name, patch_name, out_name=None, level=2, thumbnail_size=None):
     with h5py.File(patch_name, 'r') as f:
         dset = f['coords']
 
@@ -329,36 +336,24 @@ def stitch(svs_name, patch_name, out_name=None, level=2):
                 canvas[coord[1]:coord[1] + patch_size, coord[0]:coord[0] + patch_size, :] = patch[:size[0], :size[1], :]
 
     if out_name:
-        Image.fromarray(canvas).save(out_name)
+        img = Image.fromarray(canvas)
+        if thumbnail_size:
+            img = img.resize(scale(img.size, thumbnail_size))
+        img.save(out_name)
 
     return canvas
 
 def point_in_contour(point: tuple, contour: np.array):
     return cv2.pointPolygonTest(contour, point, False) >= 0
 
-def process_h5(patch_name, xml_name, out_name):
-    contours = xml2contours(xml_name)
-    coords = []
-    with h5py.File(patch_name, 'r') as fin, h5py.File(out_name, 'w') as fout:
-        for coord in fin['coords']:
-            coord = (int(coord[0]), int(coord[1]))
-            flag = False
-            for contour in contours:
-                if point_in_contour(coord, contour):
-                    flag = True
-                    break
-            if flag:
-                coords.append(coord)
-
-        fout.create_dataset('/coords', data=coords)
-        fout['coords'].attrs.update(fin['coords'].attrs)
-        fout['coords'].attrs['save_path'] = os.path.dirname(out_name)
-
-        print(f'{len(coords)}/{len(fin["coords"])}')
-
 def dict2json(json_name, d):
     with open(json_name, 'w') as f:
         f.write(json.dumps(d, indent=2, separators=(', ', ': ')))
+
+def dict2csv(csv_name, d, index=None):
+    if not index:
+        index = range(1, len(d[get_dict_key(d, 0)]) + 1)
+    pd.DataFrame(d, index=index).to_csv(csv_name, float_format='%.3f')
 
 def json2dict(json_name):
     if not os.path.exists(json_name):
@@ -386,3 +381,9 @@ def mkdirs(dir_names):
 def rmdirs(dir_names):
     for dir_name in dir_names:
         rmdir(dir_name)
+
+def mv(src, dst):
+    move(src, dst)
+
+def get_dict_key(d, idx):
+    return list(d.keys())[idx]
